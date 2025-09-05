@@ -1,0 +1,90 @@
+# --- add these imports at the top of main.py (alongside your existing ones) ---
+from fastapi import Body, Response
+import httpx
+from httpx import Timeout
+
+# --- add these globals (near your other env/config constants) ---
+API_BASE_PATH = os.getenv("API_BASE_PATH", "").strip()
+AUTH_TOKEN    = os.getenv("AUTH_TOKEN", "").strip()
+
+# Reusable HTTP client (created on startup, closed on shutdown)
+@app.on_event("startup")
+async def _startup_http_client():
+    # Create a shared async client if env vars are present; otherwise keep None and fail per-request.
+    client = None
+    if API_BASE_PATH and AUTH_TOKEN:
+        client = httpx.AsyncClient(
+            base_url=API_BASE_PATH.rstrip("/"),
+            timeout=Timeout(10.0, read=30.0),
+            headers={
+                "Authorization": f"Bearer {AUTH_TOKEN}",
+                "Accept": "*/*",
+                "Content-Type": "application/json",
+            },
+        )
+    app.state.http_client = client
+
+@app.on_event("shutdown")
+async def _shutdown_http_client():
+    client: Optional[httpx.AsyncClient] = getattr(app.state, "http_client", None)
+    if client is not None:
+        await client.aclose()
+
+# --- NEW ROUTE: simple passthrough POST to <API_BASE_PATH>/details using Bearer token ---
+@app.post("/fetch-details__test")
+async def fetch_details__test(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    """
+    Test endpoint: forwards a POST with the given JSON payload to
+    <API_BASE_PATH>/details using Authorization: Bearer <AUTH_TOKEN>.
+    The upstream response body is returned **as-is** (no transformation),
+    with the original status code and content-type.
+    """
+    if not API_BASE_PATH or not AUTH_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing API_BASE_PATH or AUTH_TOKEN environment variables."
+        )
+
+    # Ensure client exists even if startup hook didn't run (e.g., in some test contexts)
+    client: Optional[httpx.AsyncClient] = getattr(app.state, "http_client", None)
+    if client is None:
+        client = httpx.AsyncClient(
+            base_url=API_BASE_PATH.rstrip("/"),
+            timeout=Timeout(10.0, read=30.0),
+            headers={
+                "Authorization": f"Bearer {AUTH_TOKEN}",
+                "Accept": "*/*",
+                "Content-Type": "application/json",
+            },
+        )
+        # Do not attach to app.state here; we'll just close it after the call.
+
+        try:
+            resp = await client.post("/details", json=payload or {})
+        except httpx.ReadTimeout:
+            await client.aclose()
+            raise HTTPException(status_code=504, detail="Upstream timeout while calling /details")
+        except httpx.HTTPError as e:
+            await client.aclose()
+            raise HTTPException(status_code=502, detail=f"Upstream request error: {str(e)}")
+
+        # Mirror upstream response exactly (status + content-type + body)
+        content_type = resp.headers.get("content-type", "application/octet-stream")
+        body = resp.content
+        status = resp.status_code
+        await client.aclose()
+        return Response(content=body, status_code=status, media_type=content_type)
+
+    # Normal path: reuse shared client
+    try:
+        resp = await client.post("/details", json=payload or {})
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail="Upstream timeout while calling /details")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream request error: {str(e)}")
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/octet-stream"),
+    )
